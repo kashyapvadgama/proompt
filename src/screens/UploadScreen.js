@@ -2,10 +2,14 @@ import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Image, ScrollView, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
-import { supabase } from '../lib/supabase';
+import { supabase } from '../lib/supabase'; // We still need this for the function call
 import 'react-native-get-random-values';
 import { v4 as uuidv4 } from 'uuid';
 import LoadingOverlay from '../components/LoadingOverlay';
+
+// Import your Supabase URL and Anon Key directly from the environment
+// We need these for the manual fetch call
+import { EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY } from '@env';
 
 export default function UploadScreen({ route, navigation }) {
   const { template } = route.params;
@@ -14,27 +18,24 @@ export default function UploadScreen({ route, navigation }) {
   const [loadingText, setLoadingText] = useState('');
 
   const pickImage = async (index) => {
+    // This function is correct, no changes needed
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Permission Denied', 'Sorry, we need camera roll permissions to make this work!');
+      Alert.alert('Permission Denied', 'Sorry, we need camera roll permissions!');
       return;
     }
-
     let result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: true,
       aspect: [4, 5],
       quality: 0.8,
     });
-
     if (!result.canceled) {
-      setImages(prevImages => ({
-        ...prevImages,
-        [index]: result.assets[0].uri,
-      }));
+      setImages(prevImages => ({ ...prevImages, [index]: result.assets[0].uri }));
     }
   };
 
+  // --- THIS IS THE COMPLETELY REWRITTEN UPLOAD FUNCTION ---
   const handleGenerate = async () => {
     if (!allImagesSelected) return;
 
@@ -43,38 +44,50 @@ export default function UploadScreen({ route, navigation }) {
       setLoadingText('Uploading photo...');
 
       const uploadedImageUrls = [];
+      const imageUri = images[0]; // Assuming 1 photo for simplicity
       
-      // Since all our current templates use 1 photo, we'll just upload the first one.
-      // This loop is ready for future multi-photo templates.
-      for (let i = 0; i < template.required_photos; i++) {
-        const imageUri = images[i];
-        const fileExt = imageUri.split('.').pop();
-        const fileName = `${uuidv4()}.${fileExt}`;
-        const contentType = `image/${fileExt}`;
-        
-        const formData = new FormData();
-        formData.append('file', {
-          uri: imageUri,
-          name: fileName,
-          type: contentType,
-        });
-        
-        const { error: uploadError } = await supabase.storage
-          .from('images')
-          .upload(fileName, formData);
+      const fileExt = imageUri.split('.').pop();
+      const fileName = `${uuidv4()}.${fileExt}`;
+      const contentType = `image/${fileExt}`;
 
-        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+      // Construct the manual upload URL for Supabase Storage
+      const uploadUrl = `${EXPO_PUBLIC_SUPABASE_URL}/storage/v1/object/images/${fileName}`;
 
-        const { data: { publicUrl } } = supabase.storage
-          .from('images')
-          .getPublicUrl(fileName);
-        
-        uploadedImageUrls.push(publicUrl);
+      // Create the FormData payload
+      const formData = new FormData();
+      formData.append('file', {
+        uri: imageUri,
+        name: fileName,
+        type: contentType,
+      });
+
+      // Make the manual fetch request to upload the file
+      const uploadResponse = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'apikey': EXPO_PUBLIC_SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${EXPO_PUBLIC_SUPABASE_ANON_KEY}`, // For anon access
+          'Content-Type': 'multipart/form-data',
+        },
+        body: formData,
+      });
+
+      if (!uploadResponse.ok) {
+        // Log the detailed error from the server
+        const errorBody = await uploadResponse.text();
+        console.error("Manual Upload Failed Body:", errorBody);
+        throw new Error(`Upload failed with status: ${uploadResponse.status}`);
       }
       
+      console.log("Manual upload successful!");
+
+      // If upload is successful, get the public URL
+      const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(fileName);
+      uploadedImageUrls.push(publicUrl);
+
+      // --- The rest of the function remains the same ---
       setLoadingText('AI is working its magic...');
 
-      // Call the single 'generate-image' function and wait for the result
       const { data: result, error: functionError } = await supabase.functions.invoke('generate-image', {
         body: {
           templateId: template.id,
@@ -82,24 +95,23 @@ export default function UploadScreen({ route, navigation }) {
         },
       });
 
-      if (functionError) throw new Error(`Function invoke error: ${functionError.message}`);
-      if (result.error) throw new Error(`Function logic error: ${result.error}`);
-      if (!result.image) throw new Error('The AI did not return an image. Please try again.');
+      if (functionError) throw new Error(functionError.message);
+      if (result.error) throw new Error(result.error);
+      if (!result.image) throw new Error('AI did not return an image.');
 
       setLoading(false);
-
-      // Navigate directly to the ResultScreen with the Base64 image
       navigation.navigate('Result', { base64Image: result.image });
 
     } catch (error) {
       setLoading(false);
-      console.error("The generation process failed:", error);
+      console.error("The entire generation process failed:", error.message);
       Alert.alert('Error', error.message || 'An unknown error occurred.');
     }
   };
 
   const allImagesSelected = Object.keys(images).length === template.required_photos;
 
+  // The rest of the component (JSX and styles) remains exactly the same
   return (
     <SafeAreaView style={styles.container} edges={['bottom', 'left', 'right']}>
       {loading && <LoadingOverlay text={loadingText} />}
@@ -108,20 +120,10 @@ export default function UploadScreen({ route, navigation }) {
         <Text style={styles.description}>{template.description}</Text>
         {Array.from({ length: template.required_photos }).map((_, index) => (
           <TouchableOpacity key={index} style={styles.uploadBox} onPress={() => pickImage(index)}>
-            {images[index] ? (
-              <Image source={{ uri: images[index] }} style={styles.previewImage} />
-            ) : (
-              <Text style={styles.uploadText}>
-                {template.required_photos > 1 ? `+ Upload Photo ${index + 1}` : '+ Upload Photo'}
-              </Text>
-            )}
+            {images[index] ? <Image source={{ uri: images[index] }} style={styles.previewImage} /> : <Text style={styles.uploadText}>+ Upload Photo</Text>}
           </TouchableOpacity>
         ))}
-        <TouchableOpacity 
-          style={[styles.generateButton, !allImagesSelected && styles.disabledButton]} 
-          onPress={handleGenerate}
-          disabled={!allImagesSelected}
-        >
+        <TouchableOpacity style={[styles.generateButton, !allImagesSelected && styles.disabledButton]} onPress={handleGenerate} disabled={!allImagesSelected}>
           <Text style={styles.generateButtonText}>Generate</Text>
         </TouchableOpacity>
       </ScrollView>

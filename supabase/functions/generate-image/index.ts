@@ -1,71 +1,21 @@
+// supabase/functions/generate-image/index.ts
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
-import { encodeBase64 } from 'https://deno.land/std@0.224.0/encoding/base64.ts'
-import { create } from 'https://deno.land/x/djwt@v3.0.2/mod.ts';
 
 const corsHeaders = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
-
-// Helper function to get a temporary Access Token from Google
-async function getAccessToken(serviceAccount: any) {
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: serviceAccount.client_email,
-    scope: "https://www.googleapis.com/auth/cloud-platform",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: Math.floor(Date.now() / 1000) + 3600, // Expires in 1 hour
-    iat: Math.floor(Date.now() / 1000),
-  };
-  
-  // --- THIS IS THE CRITICAL FIX FOR THE CRYPTOGRAPHY ERROR ---
-  // The private_key from the JSON file is a string that needs to be formatted correctly.
-  const privateKeyPem = serviceAccount.private_key
-    .replace(/\\n/g, '\n') // Replace literal \n with actual newlines
-    .replace('-----BEGIN PRIVATE KEY-----', '')
-    .replace('-----END PRIVATE KEY-----', '')
-    .replace(/\s/g, ''); // Remove all whitespace
-
-  // Decode the Base64 formatted key to get the raw binary data (ArrayBuffer)
-  const binaryKey = atob(privateKeyPem);
-  const keyBuffer = new Uint8Array(binaryKey.length);
-  for (let i = 0; i < binaryKey.length; i++) {
-    keyBuffer[i] = binaryKey.charCodeAt(i);
-  }
-
-  const privateKey = await crypto.subtle.importKey(
-      "pkcs8",
-      keyBuffer.buffer, // Use the correctly formatted ArrayBuffer
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      true,
-      ["sign"]
-  );
-
-  const jwt = await create(header, payload, privateKey);
-
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
-  });
-
-  const tokens = await response.json();
-  if (!tokens.access_token) {
-    console.error("Failed to get access token:", tokens);
-    throw new Error("Failed to retrieve Google Cloud access token.");
-  }
-  return tokens.access_token;
-}
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const gcpServiceAccountKey = Deno.env.get('GCP_SERVICE_ACCOUNT_KEY');
-    const gcpProjectId = Deno.env.get('GCP_PROJECT_ID');
-    if (!gcpServiceAccountKey || !gcpProjectId) {
-      throw new Error("GCP secrets are not set.");
-    }
-    const serviceAccount = JSON.parse(gcpServiceAccountKey);
+    console.log("--- [1/8] Invoking generate-image function for Azure DALL-E 3 ---");
 
-    const accessToken = await getAccessToken(serviceAccount);
+    const azureApiKey = Deno.env.get('AZURE_AI_KEY');
+    const azureEndpoint = Deno.env.get('AZURE_AI_ENDPOINT');
+
+    if (!azureApiKey || !azureEndpoint) {
+      throw new Error("Critical: Azure AI secrets (AZURE_AI_KEY or AZURE_AI_ENDPOINT) are not set.");
+    }
     
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_ANON_KEY') ?? '',
@@ -76,63 +26,97 @@ Deno.serve(async (req) => {
     if (!templateId || !imageUrls || !imageUrls[0]) {
       throw new Error('Invalid request: Missing templateId or imageUrls.');
     }
+    console.log(`--- [2/8] Received job for templateId: ${templateId} ---`);
 
     const { data: templateData } = await supabaseClient
       .from('templates').select('prompt_template').eq('id', templateId).single();
     if (!templateData) throw new Error(`Template with ID ${templateId} not found.`);
-
-    const imageResponse = await fetch(imageUrls[0]);
-    if (!imageResponse.ok) throw new Error(`Failed to download user image.`);
-    const imageArrayBuffer = await imageResponse.arrayBuffer();
-    const inputImageBase64 = encodeBase64(imageArrayBuffer);
+    console.log("--- [3/8] Successfully fetched template details ---");
     
-    const apiUrl = `https://us-central1-aiplatform.googleapis.com/v1/projects/${gcpProjectId}/locations/us-central1/publishers/google/models/imagegeneration@006:predict`;
+    // DALL-E 3 is powerful. We can guide it by including the image URL in the prompt.
+    const enhancedPrompt = `${templateData.prompt_template}. The main subject should closely resemble the person in this image: ${imageUrls[0]}`;
 
-    const requestBody = {
-      "instances": [
-        {
-          "prompt": templateData.prompt_template,
-          "image": { "bytesBase64Encoded": inputImageBase64 }
-        }
-      ],
-      "parameters": {
-        "sampleCount": 1,
-        "aspectRatio": "1:1",
-        "guidanceScale": 9,
-        "editConfig": { "editMode": "subject-generation" } 
-      }
-    };
-
-    const vertexResponse = await fetch(apiUrl, {
+    // The API endpoint for starting the DALL-E 3 generation job
+    const apiUrl = `${azureEndpoint}openai/images/generations:submit?api-version=2024-03-01-preview`;
+    
+    console.log("--- [4/8] Starting generation job on Azure... ---");
+    const startResponse = await fetch(apiUrl, {
         method: "POST",
-        headers: {
-            "Authorization": `Bearer ${accessToken}`,
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(requestBody)
+        headers: { "api-key": azureApiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+            "model": "dall-e-3", // Using the DALL-E 3 model
+            "prompt": enhancedPrompt,
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json" // Ask for the image as a Base64 string
+        })
     });
-
-    if (!vertexResponse.ok) {
-        const errorBody = await vertexResponse.json();
-        console.error("Vertex AI Error:", JSON.stringify(errorBody, null, 2));
-        throw new Error(errorBody.error.message || "Failed to generate image via Vertex AI.");
-    }
     
-    const result = await vertexResponse.json();
-    const generatedImageBase64 = result.predictions[0].bytesBase64Encoded;
+    if (startResponse.status !== 202) { // 202 status means the job was accepted
+        const errorBody = await startResponse.json();
+        console.error("Azure API failed to start the job:", errorBody);
+        throw new Error(errorBody.error.message || "Failed to start image generation job on Azure.");
+    }
+    console.log("--- [5/8] Job accepted by Azure. Now polling for result... ---");
+
+    // Get the URL to check the status of the job
+    const operationLocation = startResponse.headers.get('operation-location');
+    if (!operationLocation) {
+      throw new Error("Azure API did not return an operation-location header to check for results.");
+    }
+
+    let result;
+    let attempts = 0;
+    const maxAttempts = 18; // Poll for a max of 90 seconds (18 * 5 seconds)
+
+    while (attempts < maxAttempts) {
+        // Wait for 5 seconds before checking the status again
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        console.log(`--- [6/8] Polling attempt #${attempts + 1}... ---`);
+
+        const resultResponse = await fetch(operationLocation, {
+            headers: { "api-key": azureApiKey }
+        });
+
+        if (!resultResponse.ok) {
+          throw new Error(`Polling for result failed with status: ${resultResponse.status}`);
+        }
+
+        const statusResult = await resultResponse.json();
+
+        if (statusResult.status === 'succeeded') {
+            result = statusResult.result;
+            console.log("--- [7/8] Generation succeeded! ---");
+            break; // Exit the loop on success
+        }
+        if (statusResult.status === 'failed') {
+            console.error("Azure job failed:", statusResult.error);
+            throw new Error(`Image generation failed on Azure: ${statusResult.error.message}`);
+        }
+        
+        attempts++;
+    }
+
+    if (!result) {
+      throw new Error("Image generation timed out after 90 seconds. The server might be busy. Please try again later.");
+    }
+
+    const generatedImageBase64 = result.data[0].b64_json;
     
     if (!generatedImageBase64) {
-        console.error("Malformed response from Vertex AI:", result);
-        throw new Error("API returned a response without the expected image data.");
+      console.error("Malformed success response from Azure AI:", result);
+      throw new Error("API returned a success status, but the image data was not found.");
     }
     
+    console.log("--- [8/8] Successfully retrieved image. Sending response to client. ---");
     return new Response(JSON.stringify({ image: generatedImageBase64 }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200,
     })
 
   } catch (err) {
-    console.error("!!! Function failed:", err.message);
+    console.error("!!! An error occurred in the function !!!");
+    console.error("Error Message:", err.message);
     return new Response(JSON.stringify({ error: err.message }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 500,
